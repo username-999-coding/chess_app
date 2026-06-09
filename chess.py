@@ -390,8 +390,10 @@ class Piece:
 
     def load_image(self, size):
         filename = f"{self.color}_{self.piece_type}.png" 
-        ori_path = r"C:\Users\User\Documents\Python\chess" 
-        path = os.path.join(ori_path, filename) 
+        
+        base_dir = os.path.dirname(__file__)
+        path = os.path.join(base_dir, "assets", filename)
+        
         image = Image.open(path) 
         image = image.convert("RGBA")
         image = image.resize((size, size)) 
