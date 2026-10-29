@@ -1,9 +1,10 @@
 import tkinter as tk
-from tkinter import Tk, Canvas, Label, Button, Frame, PhotoImage, Toplevel, messagebox
-import time
+from tkinter import Tk, Canvas, Label, Button, Frame, Toplevel, messagebox
 from PIL import Image, ImageTk
 import os
 import random
+import time
+import math
 
 class Board:
     def __init__(self):
@@ -48,6 +49,13 @@ class Board:
                     continue
 
     def move_piece(self, from_where, to):
+        target = self.grid[to[0]][to[1]]
+        if target is not None and target.piece_type == "rook" and to[0] == (7 if target.color == "light" else 0):
+            if to[1] == 7:
+                self.castling[target.color]["kingside"] = False
+            elif to[1] == 0:
+                self.castling[target.color]["queenside"] = False
+
         #* 1.
         piece = self.grid[from_where[0]][from_where[1]]
         self.grid[to[0]][to[1]] = piece
@@ -161,7 +169,11 @@ class Board:
             for c in range(8):
                 p = self.grid[r][c]
                 if p is not None and p.color != our_color:
-                    if (row, col) in p.get_moves(self):
+                    if p.piece_type == "pawn":
+                        direction = -1 if p.color == "light" else 1
+                        if row == r + direction and abs(col - c) == 1:
+                            return True
+                    elif (row, col) in p.get_moves(self):
                         return True
         return False
     
@@ -357,11 +369,11 @@ class Piece:
                     continue
 
             if self.has_moved == False:
-                if board.castling[self.color]["kingside"]:
+                if board.castling[self.color]["kingside"] and board.grid[self.row][7] is not None and board.grid[self.row][7].piece_type == "rook" and board.grid[self.row][7].color == self.color:
                     if board.grid[self.row][5] is None and board.grid[self.row][6] is None:
                         moves.append((self.row, 6))
 
-                if board.castling[self.color]["queenside"]:
+                if board.castling[self.color]["queenside"] and board.grid[self.row][0] is not None and board.grid[self.row][0].piece_type == "rook" and board.grid[self.row][0].color == self.color:
                     if board.grid[self.row][1] is None and board.grid[self.row][2] is None and board.grid[self.row][3] is None:
                         moves.append((self.row, 2))
 
@@ -390,10 +402,10 @@ class Piece:
 
     def load_image(self, size):
         filename = f"{self.color}_{self.piece_type}.png" 
+        # Direct the path past the 'assets' folder and the 'chess' subfolder
+        ori_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asset", "chess")
         
-        base_dir = os.path.dirname(__file__)
-        path = os.path.join(base_dir, "assets", filename)
-        
+        path = os.path.join(ori_path, filename) 
         image = Image.open(path) 
         image = image.convert("RGBA")
         image = image.resize((size, size)) 
@@ -478,6 +490,17 @@ class AI:
             [ 20, 30, 10,  0,  0, 10, 30, 20]
         ]
 
+        self.king_endgame_table = [
+            [-50,-40,-30,-20,-20,-30,-40,-50],
+            [-30,-20,-10,  0,  0,-10,-20,-30],
+            [-30,-10, 20, 30, 30, 20,-10,-30],
+            [-30,-10, 30, 40, 40, 30,-10,-30],
+            [-30,-10, 30, 40, 40, 30,-10,-30],
+            [-30,-10, 20, 30, 30, 20,-10,-30],
+            [-30,-30,  0,  0,  0,  0,-30,-30],
+            [-50,-30,-30,-30,-30,-30,-30,-50]
+        ]
+
         self.tables = {
             "pawn": self.pawn_table,
             "knight": self.knight_table,
@@ -524,107 +547,269 @@ class AI:
         best_move = random.choice(all_moves)
         return best_move
 
-    def evaluate_board(self, board, is_hard):
-        if board.is_in_checkmate(self.enemy_color): return float("inf")
-        if board.is_in_checkmate(self.color): return float("-inf")
-        if board.is_in_stalemate(self.enemy_color): return 0
+    MATE = 100000
 
-        total_score = 0
+    def make_move(self, board, from_pos, to_pos):
+        fr, fc = from_pos
+        tr, tc = to_pos
+        piece = board.grid[fr][fc]
+        captured = board.grid[tr][tc]
+        cap_pos = (tr, tc)
+
+        undo = {
+            "piece": piece, "from": from_pos, "to": to_pos,
+            "type": piece.piece_type, "had_moved": piece.has_moved,
+            "ep": board.en_passant_target,
+            "castling": {c: dict(v) for c, v in board.castling.items()},
+            "rook_move": None,
+        }
+
+        #* en passant: the captured pawn is located to the side, not on the destination square
+        if piece.piece_type == "pawn" and fc != tc and captured is None and to_pos == board.en_passant_target:
+            cap_pos = (fr, tc)
+            captured = board.grid[fr][tc]
+            board.grid[fr][tc] = None
+
+        undo["captured"] = captured
+        undo["cap_pos"] = cap_pos
+
+        board.grid[tr][tc] = piece
+        board.grid[fr][fc] = None
+        piece.row, piece.col = tr, tc
+        piece.has_moved = True
+
+        #* castling: the rook also moves
+        if piece.piece_type == "king" and abs(tc - fc) == 2:
+            rook_from, rook_to = (7, 5) if tc > fc else (0, 3)
+            rook = board.grid[fr][rook_from]
+            if rook is not None:
+                board.grid[fr][rook_to] = rook
+                board.grid[fr][rook_from] = None
+                undo["rook_move"] = (rook, fr, rook_from, rook_to, rook.has_moved)
+                rook.col = rook_to
+                rook.has_moved = True
+
+        #* right to castle
+        home = 7 if piece.color == "light" else 0
+        if piece.piece_type == "king":
+            board.castling[piece.color]["kingside"] = False
+            board.castling[piece.color]["queenside"] = False
+        elif piece.piece_type == "rook" and fr == home:
+            if fc == 7:
+                board.castling[piece.color]["kingside"] = False
+            elif fc == 0:
+                board.castling[piece.color]["queenside"] = False
+        if captured is not None and captured.piece_type == "rook":
+            cap_home = 7 if captured.color == "light" else 0
+            if cap_pos[0] == cap_home:
+                if cap_pos[1] == 7:
+                    board.castling[captured.color]["kingside"] = False
+                elif cap_pos[1] == 0:
+                    board.castling[captured.color]["queenside"] = False
+
+        #* promosi (automatically becomes "queen" in search)
+        if undo["type"] == "pawn" and (tr == 0 or tr == 7):
+            piece.piece_type = "queen"
+
+        #* en passant target
+        if undo["type"] == "pawn" and abs(tr - fr) == 2:
+            board.en_passant_target = ((fr + tr) // 2, tc)
+        else:
+            board.en_passant_target = None
+
+        return undo
+
+    def undo_move(self, board, undo):
+        piece = undo["piece"]
+        fr, fc = undo["from"]
+        tr, tc = undo["to"]
+
+        piece.piece_type = undo["type"]
+        piece.has_moved = undo["had_moved"]
+        piece.row, piece.col = fr, fc
+        board.grid[fr][fc] = piece
+        board.grid[tr][tc] = None
+
+        if undo["captured"] is not None:
+            cr, cc = undo["cap_pos"]
+            board.grid[cr][cc] = undo["captured"]
+
+        if undo["rook_move"] is not None:
+            rook, row, rook_from, rook_to, rook_had_moved = undo["rook_move"]
+            board.grid[row][rook_to] = None
+            board.grid[row][rook_from] = rook
+            rook.col = rook_from
+            rook.has_moved = rook_had_moved
+
+        board.en_passant_target = undo["ep"]
+        board.castling = undo["castling"]
+
+    def order_moves(self, board, moves):
+        #* Prioritize captures (MVV-LVA) + promotions, to allow alpha-beta to perform more pruning.
+        def score(move):
+            (fr, fc), (tr, tc) = move
+            attacker = board.grid[fr][fc]
+            victim = board.grid[tr][tc]
+            s = 0
+            if victim is not None:
+                s += 10 * self.piece_value[victim.piece_type] - min(self.piece_value[attacker.piece_type], 1000)
+            if attacker.piece_type == "pawn" and (tr == 0 or tr == 7):
+                s += 800
+            return s
+        return sorted(moves, key=score, reverse=True)
+
+    def evaluate_hard(self, board):
+        pieces = []
+        non_pawn_material = 0
         for row in range(8):
             for col in range(8):
-                square = board.grid[row][col]
-                if square is not None:
-                    val = self.piece_value[square.piece_type]
+                p = board.grid[row][col]
+                if p is not None:
+                    pieces.append((p, row, col))
+                    if p.piece_type not in ("pawn", "king"):
+                        non_pawn_material += self.piece_value[p.piece_type]
 
-                    pos_score = 0
-                    if is_hard:
-                        row_index = 7 - row if square.color == 'light' else row
-                        pos_score = self.tables[square.piece_type][row_index][col]
+        endgame = non_pawn_material <= 2400
+        score = 0
+        bishops = {"light": 0, "dark": 0}
 
-                    if square.color == self.color:
-                        total_score += (val + pos_score)
-                    else:
-                        total_score -= (val + pos_score)
-                        
-        return total_score
+        for p, row, col in pieces:
+            #* The table is written from the perspective of the "light" side (row 0 = the opponent's side).
+            #* For light, use the row directly; for dark, reverse it.
+            idx = row if p.color == "light" else 7 - row
 
-    def minimax(self, board, depth, alpha, beta, is_maximazing, is_hard, use_ab):
-        if depth == 0 or board.status == "game_over":
-            return self.evaluate_board(board, is_hard), None
-            
-        best_move = None
-        
-        if is_maximazing:
-            high_score = float("-inf")
-            all_moves = board.get_legal_moves_ai(self.color)
-            if not all_moves:
-                if board.is_in_check(self.color):
-                    return -99999 + (4 - depth), None
-                return 0, None
-            
-            for (from_pos, to_pos) in all_moves:
-                moved_piece = board.grid[from_pos[0]][from_pos[1]]
-                target_backup = board.grid[to_pos[0]][to_pos[1]]
-                orig_row, orig_col = moved_piece.row, moved_piece.col
-                
-                moved_piece.row, moved_piece.col = to_pos[0], to_pos[1]
-                board.grid[to_pos[0]][to_pos[1]] = moved_piece
-                board.grid[from_pos[0]][from_pos[1]] = None
+            if p.piece_type == "king" and endgame:
+                pos = self.king_endgame_table[idx][col]
+            else:
+                pos = self.tables[p.piece_type][idx][col]
 
-                score, _ = self.minimax(board, depth - 1, alpha, beta, False, is_hard, use_ab)
-                
-                board.grid[from_pos[0]][from_pos[1]] = moved_piece
-                board.grid[to_pos[0]][to_pos[1]] = target_backup
-                moved_piece.row, moved_piece.col = orig_row, orig_col
+            value = self.piece_value[p.piece_type] + pos
+            if p.piece_type == "bishop":
+                bishops[p.color] += 1
 
-                if score > high_score:
-                    high_score = score
-                    best_move = (from_pos, to_pos)
-                
-                if use_ab:
-                    alpha = max(alpha, score)
-                    if beta <= alpha: break
-            return high_score, best_move
+            score += value if p.color == self.color else -value
 
+        if bishops[self.color] >= 2:
+            score += 30
+        if bishops[self.enemy_color] >= 2:
+            score -= 30
+
+        return score
+
+    def quiescence(self, board, alpha, beta, is_max, q_depth):
+        #* Just continuing to check the captured results so the bot doesn't end up "blind" at the end of the search.
+        stand_pat = self.evaluate_hard(board)
+        if q_depth == 0:
+            return stand_pat
+
+        color = self.color if is_max else self.enemy_color
+        captures = []
+        for r in range(8):
+            for c in range(8):
+                p = board.grid[r][c]
+                if p is None or p.color != color or p.piece_type == "king":
+                    continue
+                for tr, tc in p.get_moves(board):
+                    victim = board.grid[tr][tc]
+                    if victim is not None and victim.piece_type != "king":
+                        captures.append(((r, c), (tr, tc)))
+        captures = self.order_moves(board, captures)
+
+        if is_max:
+            best = stand_pat
+            if best >= beta:
+                return best
+            alpha = max(alpha, best)
+            for from_pos, to_pos in captures:
+                undo = self.make_move(board, from_pos, to_pos)
+                score = self.quiescence(board, alpha, beta, False, q_depth - 1)
+                self.undo_move(board, undo)
+                best = max(best, score)
+                alpha = max(alpha, best)
+                if alpha >= beta:
+                    break
+            return best
         else:
-            low_score = float("inf")
-            all_moves = board.get_legal_moves_ai(self.enemy_color)
-            if not all_moves:
-                if board.is_in_check(self.enemy_color):
-                    return 99999 - (4 - depth), None
-                return 0, None
-            
-            for (from_pos, to_pos) in all_moves:
-                moved_piece = board.grid[from_pos[0]][from_pos[1]]
-                target_backup = board.grid[to_pos[0]][to_pos[1]]
-                orig_row, orig_col = moved_piece.row, moved_piece.col
-                
-                moved_piece.row, moved_piece.col = to_pos[0], to_pos[1]
-                board.grid[to_pos[0]][to_pos[1]] = moved_piece
-                board.grid[from_pos[0]][from_pos[1]] = None
-                
-                score, _ = self.minimax(board, depth - 1, alpha, beta, True, is_hard, use_ab)
-                
-                board.grid[from_pos[0]][from_pos[1]] = moved_piece
-                board.grid[to_pos[0]][to_pos[1]] = target_backup
-                moved_piece.row, moved_piece.col = orig_row, orig_col
+            best = stand_pat
+            if best <= alpha:
+                return best
+            beta = min(beta, best)
+            for from_pos, to_pos in captures:
+                undo = self.make_move(board, from_pos, to_pos)
+                score = self.quiescence(board, alpha, beta, True, q_depth - 1)
+                self.undo_move(board, undo)
+                best = min(best, score)
+                beta = min(beta, best)
+                if alpha >= beta:
+                    break
+            return best
 
-                if score < low_score:
-                    low_score = score
-                    best_move = (from_pos, to_pos)
-                
-                if use_ab:
-                    beta = min(beta, score)
-                    if beta <= alpha: break
-            return low_score, best_move
-        
+    def minimax_hard(self, board, depth, alpha, beta, is_max, ply):
+        color = self.color if is_max else self.enemy_color
+
+        if depth <= 0:
+            in_check = board.is_in_check(color)
+            #* When in check, extend the search depth slightly so that a checkmate at the end isn't missed.
+            if not in_check or depth <= -2:
+                return self.quiescence(board, alpha, beta, is_max, 2)
+
+        moves = board.get_legal_moves_ai(color)
+        if not moves:
+            if board.is_in_check(color):
+                return (-self.MATE + ply) if is_max else (self.MATE - ply)
+            return 0
+
+        moves = self.order_moves(board, moves)
+
+        if is_max:
+            best = float("-inf")
+            for from_pos, to_pos in moves:
+                undo = self.make_move(board, from_pos, to_pos)
+                score = self.minimax_hard(board, depth - 1, alpha, beta, False, ply + 1)
+                self.undo_move(board, undo)
+                best = max(best, score)
+                alpha = max(alpha, best)
+                if alpha >= beta:
+                    break
+            return best
+        else:
+            best = float("inf")
+            for from_pos, to_pos in moves:
+                undo = self.make_move(board, from_pos, to_pos)
+                score = self.minimax_hard(board, depth - 1, alpha, beta, True, ply + 1)
+                self.undo_move(board, undo)
+                best = min(best, score)
+                beta = min(beta, best)
+                if alpha >= beta:
+                    break
+            return best
+
+    def hard_bot(self, board, depth=4):
+        moves = board.get_legal_moves_ai(self.color)
+        if not moves:
+            return None
+
+        moves = self.order_moves(board, moves)
+        best_score = float("-inf")
+        best_moves = []
+
+        for from_pos, to_pos in moves:
+            undo = self.make_move(board, from_pos, to_pos)
+            alpha = best_score - 1 if best_score != float("-inf") else float("-inf")
+            score = self.minimax_hard(board, depth - 1, alpha, float("inf"), False, 1)
+            self.undo_move(board, undo)
+
+            if score > best_score:
+                best_score = score
+                best_moves = [(from_pos, to_pos)]
+            elif score == best_score:
+                best_moves.append((from_pos, to_pos))
+
+        #* If there are several steps with the exact same value, choose one at random to avoid monotony.
+        return random.choice(best_moves)
+
     def medium_bot(self, board):
-        _, best_move = self.minimax(board, depth=3, alpha=None, beta=None, is_maximazing=True, is_hard=False, use_ab=False)
-        return best_move if best_move else self.easy_bot(board)
-
-    def hard_bot(self, board):
-        _, final_step = self.minimax(board, depth=4, alpha=float("-inf"), beta=float("inf"), is_maximazing=True, is_hard=True, use_ab=True)
-        return final_step if final_step else self.easy_bot(board)
+        return self.hard_bot(board, depth=2) or self.easy_bot(board)
 
 class Timer:
     def __init__(self):
@@ -632,22 +817,36 @@ class Timer:
         self.dark_time = 600
         self.active = "light"
         self.running = False
+        self.last_time = None
+
+    def update(self):
+        if not self.running or self.last_time is None:
+            return 
+
+        now = time.time()
+        elapsed = now - self.last_time
+        self.last_time = now
+
+        if self.active == "light":
+            self.light_time -= elapsed
+        else:
+            self.dark_time -=  elapsed
 
     def start(self, color):
+        self.update()
         self.active = color
         self.running = True
+        self.last_time = time.time()
 
     def stop(self):
+        self.update()
         self.running = False
 
     def tick(self):
         if self.running == False:
-            return 
-        
-        if self.active == "light":
-            self.light_time -= 1
-        if self.active == "dark":
-            self.dark_time -= 1
+            return
+
+        self.update()
 
         if self.is_timeout(self.active):
             self.stop()
@@ -655,6 +854,7 @@ class Timer:
 
     def get_display(self, color):
         timing = self.light_time if color == "light" else self.dark_time
+        timing = max(0, int(math.ceil(timing)))
         minutes = timing // 60
         seconds = timing % 60
         return f"{minutes:02}:{seconds:02}"
@@ -676,6 +876,7 @@ class ChessApp(Tk):
 
         self.bot = AI()
         self.timing = Timer()
+        self._bot_job = None
 
         self.board_size = 640
         self.title_size = self.board_size // 8
@@ -698,8 +899,15 @@ class ChessApp(Tk):
         ai_frame.pack(side="left", padx=5)
         Label(ai_frame, text="Level AI:").pack()
         self.ai_level = tk.StringVar(value="Hard")
-        self.ai_menu = tk.OptionMenu(ai_frame, self.ai_level, "Human", "Easy", "Medium", "Hard")
+        self.ai_menu = tk.OptionMenu(ai_frame, self.ai_level, "Human", "Easy", "Medium", "Hard", command=self.on_level_change)
         self.ai_menu.pack()
+
+        color_frame = Frame(self.control_frame)
+        color_frame.pack(side="left", padx=5)
+        Label(color_frame, text="Play As:").pack()
+        self.color_first = tk.StringVar(value="Light")
+        self.color_menu = tk.OptionMenu(color_frame, self.color_first, "Light", "Dark", command=self.on_color_change)
+        self.color_menu.pack()
 
         self.history_box = tk.Text(self.control_frame, width=30, height=20, state="disabled")
         self.history_box.pack(side="left", padx=10)
@@ -713,6 +921,18 @@ class ChessApp(Tk):
         self.load_board_images()
         self.draw_board()
         self.draw_pieces()
+        self.apply_color()
+        self.update_controls()
+
+    def get_screen_coords(self, row, col):
+            if self.color_first.get() == "Dark":
+                return 7 - row, 7 - col
+            return row, col
+    
+    def get_board_coords(self, s_row, s_col):
+            if self.color_first.get() == "Dark":
+                return 7 - s_row, 7 - s_col
+            return s_row, s_col
 
     def load_board_images(self):
         for row in range(8):
@@ -727,20 +947,16 @@ class ChessApp(Tk):
 
         for row in range(8):
             for col in range(8):
-
                 color = colors[(row + col) % 2]
+                s_row, s_col = self.get_screen_coords(row, col)
 
-                x1 = col * self.title_size
-                y1 = row * self.title_size
-
+                x1 = s_col * self.title_size
+                y1 = s_row * self.title_size
                 x2 = x1 + self.title_size
                 y2 = y1 + self.title_size
 
                 self.canvas.create_rectangle(
-                    x1,
-                    y1,
-                    x2,
-                    y2,
+                    x1, y1, x2, y2,
                     fill=color,
                     outline=""
                 )
@@ -753,8 +969,9 @@ class ChessApp(Tk):
                 if piece is None:
                     continue
 
-                x = col * self.title_size + self.title_size // 2
-                y = row * self.title_size + self.title_size // 2
+                s_row, s_col = self.get_screen_coords(row, col)
+                x = s_col * self.title_size + self.title_size // 2
+                y = s_row * self.title_size + self.title_size // 2
 
                 self.canvas.create_image(
                     x,
@@ -765,15 +982,17 @@ class ChessApp(Tk):
     def on_click(self, event):
         if self.board.status != "playing":
             return
-        if self.ai_level.get() != "Human" and self.board.turn == "dark":
+        if self.is_bot_turn():
             return
     
-        col = event.x // self.title_size
-        row = event.y // self.title_size
-        piece = self.board.grid[row][col]
+        s_col = event.x // self.title_size
+        s_row = event.y // self.title_size
 
-        if row > 7 and col > 7:
+        if s_row > 7 or s_col > 7 or s_row < 0 or s_col < 0:
             return 
+
+        row, col = self.get_board_coords(s_row, s_col)
+        piece = self.board.grid[row][col] 
 
         if self.board.selected is None:
             if piece is not None and piece.color == self.board.turn:
@@ -799,18 +1018,21 @@ class ChessApp(Tk):
                 self.board.legal_moves = []
                 self.render()
 
-        if self.board.turn == "dark" and self.board.status == "playing":
-            self.after(500, self.execute_ai_move)
+        if self.is_bot_turn() and self.board.status == "playing":
+            self.schedule_bot()
 
     def execute_ai_move(self):
+        self._bot_job = None
+        if self.board.status != "playing" or not self.is_bot_turn():
+            return
+
         move = self.get_ai_move()
         if move:
             self.board.move_piece(move[0], move[1])
             self.timing.start(self.board.turn)
+            if len(self.board.move_history) == 1:
+                self.after(1000, self.tick_time)
             self.render()
-
-            if self.board.status != "playing":
-                self.render()
 
     def get_ai_move(self):
         level = self.ai_level.get()
@@ -841,63 +1063,52 @@ class ChessApp(Tk):
         piece = self.board.grid[row][col]
         self.board.promotion_pending = None
 
-        #* Black promotion
-        if piece.color == "dark":
-            if self.game_mode.get() == "1v1":
-                popup = Toplevel(self)
-                popup.title("Choose the piece")
-                popup.grab_set()
-
-                def choose_piece_dark(new_piece):
-                    piece.piece_type = new_piece
-                    piece.load_image(self.title_size)
-                    self.board.promotion_pending = None
-                    self.board.turn = "light"
-                    popup.destroy()
-                    self.render()
-
-                Button(popup, text="Queen", command=lambda: choose_piece_dark("queen")).pack(pady=2)
-                Button(popup, text="Rook", command=lambda: choose_piece_dark("rook")).pack(pady=2)
-                Button(popup, text="Bishop", command=lambda: choose_piece_dark("bishop")).pack(pady=2)
-                Button(popup, text="Knight", command=lambda: choose_piece_dark("knight")).pack(pady=5)
-                return
-            else:
-                piece.piece_type = "queen"
-                piece.load_image(self.title_size)
-                self.board.promotion_pending = None
-                self.board.turn = "light"
-                self.render()
-                return
-
-        popup = Toplevel(self)
-        popup.title("Choose the piece")
-        popup.grab_set()
-
-        def choose_piece(new_piece):
+        def finish(new_piece, popup=None):
             piece.piece_type = new_piece
             piece.load_image(self.title_size)
             self.board.promotion_pending = None
-            self.board.turn = "dark"
-            popup.destroy()
+            self.board.turn = "dark" if piece.color == "light" else "light"
+            self.timing.start(self.board.turn)
+
+            nxt = self.board.turn
+            if self.board.is_in_checkmate(nxt):
+                self.board.status = f"checkmate_{nxt}"
+            elif self.board.is_in_stalemate(nxt):
+                self.board.status = "stalemate"
+
+            if popup is not None:
+                popup.destroy()
             self.render()
 
-            self.after(500, self.execute_ai_move)
+            if self.is_bot_turn() and self.board.status == "playing":
+                self.schedule_bot()
 
-        queen_button = Button(popup, text="Queen", command=lambda: choose_piece("queen"))
-        rook_button = Button(popup, text="Rook", command=lambda: choose_piece("rook"))
-        bishop_button = Button(popup, text="Bishop", command=lambda: choose_piece("bishop"))
-        knight_button = Button(popup, text="Knight", command=lambda: choose_piece("knight"))
+        #* Bot's pawn always becomes a queen
+        if self.ai_level.get() != "Human" and piece.color == self.bot.color:
+            finish("queen")
+            return
 
-        queen_button.pack(pady=2)
-        rook_button.pack(pady=2)
-        bishop_button.pack(pady=2)
-        knight_button.pack(pady=5)
+        #* Human's pawn: choose the piece
+        popup = Toplevel(self)
+        popup.title("Choose the piece")
+        popup.grab_set()
+        popup.protocol("WM_DELETE_WINDOW", lambda: finish("queen", popup))
+
+        Button(popup, text="Queen", command=lambda: finish("queen", popup)).pack(pady=2)
+        Button(popup, text="Rook", command=lambda: finish("rook", popup)).pack(pady=2)
+        Button(popup, text="Bishop", command=lambda: finish("bishop", popup)).pack(pady=2)
+        Button(popup, text="Knight", command=lambda: finish("knight", popup)).pack(pady=5)
 
     def update_controls(self):
         if self.board.game_started:
             self.ai_menu.config(state="disabled")
         else:
             self.ai_menu.config(state="normal")
+
+        if self.board.game_started or self.ai_level.get() == "Human":
+            self.color_menu.config(state="disabled")
+        else:
+            self.color_menu.config(state="normal")
 
     def render(self):
         self.update_controls()
@@ -906,16 +1117,18 @@ class ChessApp(Tk):
 
         if self.board.selected is not None:
             row, col = self.board.selected
-            x1 = col * self.title_size
+            s_row, s_col = self.get_screen_coords(row, col)
+            x1 = s_col * self.title_size
             x2 = x1 + self.title_size
-            y1 = row * self.title_size
+            y1 = s_row * self.title_size
             y2 = y1 + self.title_size
             self.canvas.create_rectangle(x1, y1, x2, y2, fill="#F6F669", outline="")
 
         for r, c in self.board.legal_moves:
-            x1 = c * self.title_size
+            s_row, s_col = self.get_screen_coords(r, c)
+            x1 = s_col * self.title_size
             x2 = x1 + self.title_size
-            y1 = r * self.title_size
+            y1 = s_row * self.title_size
             y2 = y1 + self.title_size
             self.canvas.create_rectangle(x1, y1, x2, y2, fill="#CDD16E", outline="")
         
@@ -932,7 +1145,13 @@ class ChessApp(Tk):
         if self.board.status != "playing":
             if "checkmate" in self.board.status:
                 lose = self.board.status.split("_")[1]
-                winner = "Dark (AI)" if lose == "light" else "Light (Player)"
+                winner_color = "Light" if lose == "dark" else "Dark"
+                if self.ai_level.get() == "Human":
+                    winner = winner_color
+                elif lose == self.bot.color:
+                    winner = f"{winner_color} (Player)"
+                else:
+                    winner = f"{winner_color} (AI)"
                 messagebox.showinfo("Game Over", f"Checkmate! The winner is {winner}!")
             elif self.board.status == "stalemate":
                 messagebox.showinfo("Game Over", "Stalemate! The game ends with draw.")
@@ -956,6 +1175,39 @@ class ChessApp(Tk):
             return
         
         self.after(1000, self.tick_time)
+
+    def apply_color(self):
+        if self.color_first.get() == "Light":
+            self.bot.color, self.bot.enemy_color = "dark", "light"
+        else:
+            self.bot.color, self.bot.enemy_color = "light", "dark"
+        self.render()
+
+    def is_bot_turn(self):
+        return self.ai_level.get() != "Human" and self.board.turn == self.bot.color
+
+    def schedule_bot(self):
+        if self._bot_job is not None:
+            self.after_cancel(self._bot_job)
+        self._bot_job = self.after(500, self.execute_ai_move)
+
+    def start_bot_if_first(self):
+        if self.board.game_started or self.board.status != "playing":
+            return
+        if self.is_bot_turn():
+            self.schedule_bot()
+        elif self._bot_job is not None:
+            self.after_cancel(self._bot_job)
+            self._bot_job = None
+
+    def on_color_change(self, _=None):
+        self.apply_color()
+        self.start_bot_if_first()
+
+    def on_level_change(self, _=None):
+        self.update_controls()
+        self.apply_color()
+        self.start_bot_if_first()
 
 app = ChessApp()
 app.mainloop()
