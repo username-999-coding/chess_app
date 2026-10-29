@@ -13,3 +13,5 @@ The features:
 9. Castling (queenside and kingside)
 10. En passant
 11. Promotion
+12. Color Choice (Light and Dark)
+13. Flipping board when playing as a Dark
